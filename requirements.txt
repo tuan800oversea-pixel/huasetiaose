@@ -1,0 +1,7 @@
+streamlit>=1.44,<2
+numpy>=1.26,<3
+opencv-python-headless>=4.9,<5
+scikit-learn>=1.4,<2
+scikit-image>=0.22,<1
+pytoshop>=1.2.1
+packbits>=0.6
