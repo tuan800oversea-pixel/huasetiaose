@@ -16,6 +16,14 @@ from sklearn.cluster import KMeans
 pytoshop.codecs.packbits = packbits
 
 
+def read_image_robust(image_path, flags=cv2.IMREAD_COLOR):
+    """兼容 Windows 中文路径的读取方式。"""
+    data = np.fromfile(image_path, dtype=np.uint8)
+    if data.size == 0:
+        return None
+    return cv2.imdecode(data, flags)
+
+
 def save_uploaded_file(uploaded_file, target_dir: str) -> str:
     os.makedirs(target_dir, exist_ok=True)
     file_path = os.path.join(target_dir, uploaded_file.name)
@@ -47,7 +55,7 @@ def get_dynamic_params(pattern_bgr):
 
 
 def preprocess_mask(mask_path, target_shape):
-    mask_raw = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+    mask_raw = read_image_robust(mask_path, cv2.IMREAD_UNCHANGED)
     if mask_raw is None:
         raise FileNotFoundError(f"无法读取蒙版: {mask_path}")
 
@@ -86,7 +94,27 @@ def extract_lighting_map(base_bgr, mask_3d, gamma_val, clip_min):
     return np.repeat(lighting[:, :, np.newaxis], 3, axis=2)
 
 
-def generate_tiled_texture(texture_f, garment_h_w, scale_factor=1.0):
+def create_highlight_overlay_map(lighting_map, mask_3d):
+    """Build an Overlay-safe highlight layer with 50% gray as neutral."""
+    lighting_gray = lighting_map[:, :, 0]
+    highlight_strength = np.clip((lighting_gray - 0.55) / 0.45, 0.0, 1.0)
+    highlight_strength = np.power(highlight_strength, 0.8)
+
+    neutral_gray = np.full_like(highlight_strength, 0.5)
+    overlay_gray = neutral_gray + highlight_strength * 0.5
+    overlay_gray = (
+        overlay_gray * mask_3d[:, :, 0] + neutral_gray * (1.0 - mask_3d[:, :, 0])
+    )
+    return np.repeat(overlay_gray[:, :, np.newaxis], 3, axis=2)
+
+
+def generate_tiled_texture(
+    texture_f,
+    garment_h_w,
+    scale_factor=1.0,
+    offset_x_percent=0,
+    offset_y_percent=0,
+):
     target_h, target_w = garment_h_w
     tex_h, tex_w = texture_f.shape[:2]
     pattern_size_base = target_w / 2.0
@@ -102,8 +130,15 @@ def generate_tiled_texture(texture_f, garment_h_w, scale_factor=1.0):
     tiles_x = int(np.ceil(target_w / new_w))
     tiled = np.tile(resized_base, (tiles_y, tiles_x, 1))
 
-    start_y = (tiled.shape[0] - target_h) // 2
-    start_x = (tiled.shape[1] - target_w) // 2
+    max_shift_x = max(0, (tiled.shape[1] - target_w) // 2)
+    max_shift_y = max(0, (tiled.shape[0] - target_h) // 2)
+    shift_x = int(max_shift_x * (offset_x_percent / 100.0))
+    shift_y = int(max_shift_y * (offset_y_percent / 100.0))
+
+    start_y = (tiled.shape[0] - target_h) // 2 + shift_y
+    start_x = (tiled.shape[1] - target_w) // 2 + shift_x
+    start_y = int(np.clip(start_y, 0, tiled.shape[0] - target_h))
+    start_x = int(np.clip(start_x, 0, tiled.shape[1] - target_w))
     return tiled[start_y:start_y + target_h, start_x:start_x + target_w]
 
 
@@ -129,13 +164,21 @@ def apply_pattern_and_color_adjust(
     pattern_tile_f,
     alpha_thresh,
     scale_factor=1.0,
+    offset_x_percent=0,
+    offset_y_percent=0,
     hue_shift=0,
     sat_scale=1.0,
     val_scale=1.0,
 ):
     h, w = base_black_bgr.shape[:2]
     base_f = base_black_bgr.astype(np.float32) / 255.0
-    tiled_f = generate_tiled_texture(pattern_tile_f, (h, w), scale_factor)
+    tiled_f = generate_tiled_texture(
+        pattern_tile_f,
+        (h, w),
+        scale_factor,
+        offset_x_percent,
+        offset_y_percent,
+    )
 
     tiled_gray = cv2.cvtColor(
         (np.clip(tiled_f, 0, 1) * 255).astype(np.uint8), cv2.COLOR_BGR2GRAY
@@ -198,6 +241,8 @@ def export_layered_psd(
     pattern_tile_f,
     alpha_thresh,
     best_scale,
+    offset_x_percent,
+    offset_y_percent,
     best_h,
     best_s,
     best_v,
@@ -206,7 +251,13 @@ def export_layered_psd(
     alpha_full = np.ascontiguousarray(np.full((h, w), 255, dtype=np.uint8))
     alpha_mask = np.ascontiguousarray((mask_3d[:, :, 0] * 255).astype(np.uint8))
 
-    tiled_f = generate_tiled_texture(pattern_tile_f, (h, w), best_scale)
+    tiled_f = generate_tiled_texture(
+        pattern_tile_f,
+        (h, w),
+        best_scale,
+        offset_x_percent,
+        offset_y_percent,
+    )
     tiled_bgr = (np.clip(tiled_f, 0, 1) * 255).astype(np.uint8)
     gray = cv2.cvtColor(tiled_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
     pattern_alpha = np.ascontiguousarray(
@@ -220,9 +271,13 @@ def export_layered_psd(
         sat_scale=best_s,
         val_scale=best_v,
     )
+    highlight_overlay_map = create_highlight_overlay_map(lighting_map, mask_3d)
 
     orig_rgb = cv2.cvtColor(orig_bgr, cv2.COLOR_BGR2RGB)
     light_rgb = cv2.cvtColor((lighting_map * 255).astype(np.uint8), cv2.COLOR_BGR2RGB)
+    highlight_rgb = cv2.cvtColor(
+        (highlight_overlay_map * 255).astype(np.uint8), cv2.COLOR_BGR2RGB
+    )
     pattern_rgb = cv2.cvtColor(adjusted_pattern_bgr, cv2.COLOR_BGR2RGB)
 
     layer_bg = nested_layers.Image(
@@ -282,9 +337,24 @@ def export_layered_psd(
             -1: alpha_full,
         },
     )
+    layer_highlight = nested_layers.Image(
+        name="Highlight Overlay",
+        visible=True,
+        blend_mode=BlendMode.overlay,
+        top=0,
+        left=0,
+        bottom=h,
+        right=w,
+        channels={
+            0: np.ascontiguousarray(highlight_rgb[:, :, 0]),
+            1: np.ascontiguousarray(highlight_rgb[:, :, 1]),
+            2: np.ascontiguousarray(highlight_rgb[:, :, 2]),
+            -1: alpha_mask,
+        },
+    )
 
     parsed_psd = nested_layers.nested_layers_to_psd(
-        [layer_bg, layer_mask_img, layer_pattern, layer_lighting],
+        [layer_bg, layer_mask_img, layer_pattern, layer_lighting, layer_highlight],
         color_mode=3,
     )
     with open(output_path, "wb") as fd:
@@ -301,6 +371,8 @@ def save_result_bundle(
     pattern_tile_f,
     alpha_thresh,
     scale_factor,
+    offset_x_percent,
+    offset_y_percent,
     h_shift,
     s_scale,
     v_scale,
@@ -316,6 +388,8 @@ def save_result_bundle(
         pattern_tile_f,
         alpha_thresh,
         scale_factor,
+        offset_x_percent,
+        offset_y_percent,
         h_shift,
         s_scale,
         v_scale,
@@ -331,17 +405,20 @@ def search_pattern_mockups(
     output_dir,
     delta_e_threshold=7.0,
     export_hit_psd=True,
+    base_scale=1.0,
+    offset_x_percent=0,
+    offset_y_percent=0,
 ):
     os.makedirs(output_dir, exist_ok=True)
     start_time = time.time()
 
-    orig_black_bgr = cv2.imread(original_path)
+    orig_black_bgr = read_image_robust(original_path)
     if orig_black_bgr is None:
         raise FileNotFoundError(f"找不到底图: {original_path}")
     h, w = orig_black_bgr.shape[:2]
     mask_3d = preprocess_mask(target_mask_path, (h, w))
 
-    pattern_tile_bgr = cv2.imread(pattern_tile_path)
+    pattern_tile_bgr = read_image_robust(pattern_tile_path)
     if pattern_tile_bgr is None:
         raise FileNotFoundError(f"找不到图案文件: {pattern_tile_path}")
     pattern_tile_f = pattern_tile_bgr.astype(np.float32) / 255.0
@@ -349,14 +426,22 @@ def search_pattern_mockups(
     dyn_gamma, dyn_clip, dyn_alpha, _ = get_dynamic_params(pattern_tile_bgr)
     lighting_map = extract_lighting_map(orig_black_bgr, mask_3d, dyn_gamma, dyn_clip)
 
-    target_ref_bgr = cv2.imread(target_ref_path)
+    target_ref_bgr = read_image_robust(target_ref_path)
     if target_ref_bgr is None:
         raise FileNotFoundError(f"找不到参考图: {target_ref_path}")
     target_palette, target_weights = get_color_palette(target_ref_bgr, k=4, crop_center=True)
 
     best_coarse_diff = float("inf")
     best_coarse_params = (1.0, 0, 1.0, 1.0)
-    coarse_scales = [0.8, 1.0, 1.1, 1.2]
+    coarse_scales = sorted(
+        {
+            max(0.1, round(base_scale - 0.10, 2)),
+            max(0.1, round(base_scale - 0.05, 2)),
+            max(0.1, round(base_scale, 2)),
+            round(base_scale + 0.05, 2),
+            round(base_scale + 0.10, 2),
+        }
+    )
     coarse_hues = range(-45, 46, 15)
     coarse_sats = [0.9, 1.1, 1.3]
     coarse_vals = [0.9, 1.0, 1.2, 1.4]
@@ -372,6 +457,8 @@ def search_pattern_mockups(
                         pattern_tile_f,
                         dyn_alpha,
                         scale_factor=scale,
+                        offset_x_percent=offset_x_percent,
+                        offset_y_percent=offset_y_percent,
                         hue_shift=h_shift,
                         sat_scale=s_scale,
                         val_scale=v_scale,
@@ -383,7 +470,13 @@ def search_pattern_mockups(
                         best_coarse_params = (scale, h_shift, s_scale, v_scale)
 
     c_sc, c_h, c_s, c_v = best_coarse_params
-    fine_scales = [max(0.1, c_sc - 0.1), c_sc, c_sc + 0.1]
+    fine_scales = sorted(
+        {
+            max(0.1, round(c_sc - 0.05, 2)),
+            max(0.1, round(c_sc, 2)),
+            round(c_sc + 0.05, 2),
+        }
+    )
     fine_hues = [c_h - 5, c_h, c_h + 5]
     fine_sats = [max(0.1, c_s - 0.1), c_s, c_s + 0.1]
     fine_vals = [max(0.1, c_v - 0.1), c_v, c_v + 0.1]
@@ -403,6 +496,8 @@ def search_pattern_mockups(
                         pattern_tile_f,
                         dyn_alpha,
                         scale_factor=sc,
+                        offset_x_percent=offset_x_percent,
+                        offset_y_percent=offset_y_percent,
                         hue_shift=h_shift,
                         sat_scale=s_scale,
                         val_scale=v_scale,
@@ -438,6 +533,8 @@ def search_pattern_mockups(
                                 pattern_tile_f,
                                 dyn_alpha,
                                 sc,
+                                offset_x_percent,
+                                offset_y_percent,
                                 h_shift,
                                 s_scale,
                                 v_scale,
@@ -467,6 +564,8 @@ def search_pattern_mockups(
         pattern_tile_f,
         dyn_alpha,
         best_result["scale"],
+        offset_x_percent,
+        offset_y_percent,
         best_result["h"],
         best_result["s"],
         best_result["v"],
@@ -475,6 +574,7 @@ def search_pattern_mockups(
     return {
         "best_diff": best_result["diff"],
         "hit_count": hit_count,
+        "best_scale": best_result["scale"],
         "best_jpg_path": best_jpg_path,
         "best_psd_path": best_psd_path,
         "best_preview_path": best_jpg_path,
@@ -491,6 +591,9 @@ def process_uploaded_files(
     output_dir,
     delta_e_threshold=7.0,
     export_hit_psd=True,
+    base_scale=1.0,
+    offset_x_percent=0,
+    offset_y_percent=0,
 ):
     original_path = save_uploaded_file(original_file, input_dir)
     mask_path = save_uploaded_file(mask_file, input_dir)
@@ -505,4 +608,7 @@ def process_uploaded_files(
         output_dir=output_dir,
         delta_e_threshold=delta_e_threshold,
         export_hit_psd=export_hit_psd,
+        base_scale=base_scale,
+        offset_x_percent=offset_x_percent,
+        offset_y_percent=offset_y_percent,
     )
